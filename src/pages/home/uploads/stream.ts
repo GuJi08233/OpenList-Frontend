@@ -17,6 +17,7 @@ const ChunkedUpload = async (
   const chunkSizeMB = getSettingNumber("chunked_upload_size", 50)
   const chunkSize = chunkSizeMB * 1024 * 1024
   const totalChunks = Math.ceil(file.size / chunkSize)
+  const pwd = password()
 
   // Step 1: Create session
   const createResp: any = await r.post(
@@ -35,6 +36,7 @@ const ChunkedUpload = async (
       headers: {
         "File-Path": encodeURIComponent(uploadPath),
         Overwrite: overwrite.toString(),
+        Password: pwd,
       },
     },
   )
@@ -61,6 +63,7 @@ const ChunkedUpload = async (
         "Upload-Id": uploadId,
         "Chunk-Index": String(i),
         "Content-Type": "application/octet-stream",
+        Password: pwd,
       },
       onUploadProgress: (progressEvent) => {
         if (progressEvent.total) {
