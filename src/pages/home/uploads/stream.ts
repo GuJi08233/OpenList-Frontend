@@ -147,10 +147,7 @@ const SingleUpload = async (
         if (duration > 1) {
           const loaded = progressEvent.loaded - oldLoaded
           const speed = loaded / duration
-          const remain = progressEvent.total - progressEvent.loaded
-          const remainTime = remain / speed
           setUpload("speed", speed)
-          console.log(remainTime)
 
           oldTimestamp = timestamp
           oldLoaded = progressEvent.loaded
@@ -195,7 +192,7 @@ export const StreamUpload: Upload = async (
   const chunkSizeMB = getSettingNumber("chunked_upload_size", 50)
   const chunkSizeBytes = chunkSizeMB * 1024 * 1024
 
-  if (chunkedEnabled && file.size > chunkSizeBytes) {
+  if (chunkedEnabled && file.size >= chunkSizeBytes) {
     await ChunkedUpload(
       uploadPath,
       file,
@@ -208,7 +205,7 @@ export const StreamUpload: Upload = async (
     // Build headers for standard upload
     const headers: { [k: string]: any } = {
       "File-Path": encodeURIComponent(uploadPath),
-      "As-Task": asTask,
+      "As-Task": asTask.toString(),
       "Content-Type": file.type || "application/octet-stream",
       "Last-Modified": file.lastModified,
       Password: password(),
