@@ -4,6 +4,36 @@ import { r } from "~/utils"
 import { SetUpload, Upload } from "./types"
 import { calculateHash } from "./util"
 
+const MAX_RETRIES = 3
+const INITIAL_RETRY_DELAY_MS = 1000
+
+// Determine if an upload error response is transient (worth retrying).
+// The response interceptor returns { code, message } for all errors:
+//   code === -1       → cancelled by user (not transient)
+//   code === undefined → network error (transient)
+//   code >= 500       → server error (transient)
+//   code < 500        → client error, e.g. 400/403/404 (not transient)
+function isTransient(resp: any): boolean {
+  if (resp == null || typeof resp !== "object") return false
+  if (resp.code === -1) return false // user cancellation
+  if (resp.code === undefined) return true // network error
+  return resp.code >= 500 // server error
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error("cancelled"))
+      return
+    }
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer)
+      reject(signal.reason ?? new Error("cancelled"))
+    })
+  })
+}
+
 // Chunked upload: split file into chunks and upload via /fs/chunked/* endpoints.
 // Automatically bypasses reverse proxy body size limits (Cloudflare 100MB, etc.)
 const ChunkedUpload = async (
@@ -13,6 +43,7 @@ const ChunkedUpload = async (
   asTask: boolean,
   overwrite: boolean,
   hashValues?: { md5: string; sha1: string; sha256: string },
+  signal?: AbortSignal,
 ): Promise<void> => {
   const chunkSizeMB = getSettingNumber("chunked_upload_size", 50)
   const chunkSize = chunkSizeMB * 1024 * 1024
@@ -38,6 +69,7 @@ const ChunkedUpload = async (
         Overwrite: overwrite.toString(),
         Password: pwd,
       },
+      signal,
     },
   )
 
@@ -52,53 +84,73 @@ const ChunkedUpload = async (
   let oldTimestamp = Date.now()
   let oldLoaded = 0
 
-  // Step 2: Upload each chunk
+  // Step 2: Upload each chunk with retry
   for (let i = 0; i < totalChunks; i++) {
+    if (signal?.aborted) {
+      await abortSession(uploadId, pwd)
+      throw new Error("Upload cancelled")
+    }
+
     const start = i * chunkSize
     const end = Math.min(start + chunkSize, file.size)
     const chunk = file.slice(start, end)
+    let retries = 0
 
-    const chunkResp: any = await r.put("/fs/chunked/upload", chunk, {
-      headers: {
-        "Upload-Id": uploadId,
-        "Chunk-Index": String(i),
-        "Content-Type": "application/octet-stream",
-        Password: pwd,
-      },
-      onUploadProgress: (progressEvent) => {
-        if (progressEvent.total) {
-          const totalLoaded = uploadedBytes + progressEvent.loaded
-          const progress = ((totalLoaded / file.size) * 100) | 0
-          setUpload("progress", progress)
+    while (true) {
+      const chunkResp: any = await r.put("/fs/chunked/upload", chunk, {
+        headers: {
+          "Upload-Id": uploadId,
+          "Chunk-Index": String(i),
+          "Content-Type": "application/octet-stream",
+          Password: pwd,
+        },
+        signal,
+        onUploadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            const totalLoaded = uploadedBytes + progressEvent.loaded
+            const progress = ((totalLoaded / file.size) * 100) | 0
+            setUpload("progress", progress)
 
-          const timestamp = Date.now()
-          const duration = (timestamp - oldTimestamp) / 1000
-          if (duration > 1) {
-            const loaded = totalLoaded - oldLoaded
-            const speed = loaded / duration
-            setUpload("speed", speed)
-            oldTimestamp = timestamp
-            oldLoaded = totalLoaded
+            const timestamp = Date.now()
+            const duration = (timestamp - oldTimestamp) / 1000
+            if (duration > 1) {
+              const loaded = totalLoaded - oldLoaded
+              const speed = loaded / duration
+              setUpload("speed", speed)
+              oldTimestamp = timestamp
+              oldLoaded = totalLoaded
+            }
           }
-        }
-      },
-    })
+        },
+      })
 
-    if (chunkResp.code !== 200) {
-      // Abort the session on failure to clean up server-side temp files
-      await r
-        .post(
-          "/fs/chunked/abort",
-          { upload_id: uploadId },
-          { headers: { Password: pwd } },
-        )
-        .catch(() => {})
+      if (chunkResp.code === 200) {
+        uploadedBytes += end - start
+        break // chunk succeeded, move to next
+      }
+
+      // Cancelled by user — abort session and propagate
+      if (chunkResp.code === -1) {
+        await abortSession(uploadId, pwd)
+        throw new Error("Upload cancelled")
+      }
+
+      // Retry on transient errors with exponential backoff
+      if (isTransient(chunkResp) && retries < MAX_RETRIES) {
+        retries++
+        const backoff = INITIAL_RETRY_DELAY_MS * 2 ** (retries - 1)
+        await delay(backoff, signal)
+        continue
+      }
+
+      // Non-transient error or retries exhausted — abort session
+      await abortSession(uploadId, pwd)
       throw new Error(
-        chunkResp.message || `Failed to upload chunk ${i + 1}/${totalChunks}`,
+        chunkResp.message ||
+          `Failed to upload chunk ${i + 1}/${totalChunks}` +
+            (retries > 0 ? ` after ${retries} retries` : ""),
       )
     }
-
-    uploadedBytes += end - start
   }
 
   // Step 3: Complete — merge all chunks and write to storage
@@ -106,20 +158,25 @@ const ChunkedUpload = async (
   const completeResp: any = await r.post(
     "/fs/chunked/complete",
     { upload_id: uploadId, as_task: asTask },
-    { headers: { Password: pwd } },
+    { headers: { Password: pwd }, signal },
   )
 
   if (completeResp.code !== 200) {
     // Abort to clean up server-side temp files on complete failure
-    await r
-      .post(
-        "/fs/chunked/abort",
-        { upload_id: uploadId },
-        { headers: { Password: pwd } },
-      )
-      .catch(() => {})
+    await abortSession(uploadId, pwd)
     throw new Error(completeResp.message || "Failed to complete chunked upload")
   }
+}
+
+// Helper: abort a chunked upload session (fire-and-forget, swallows errors)
+async function abortSession(uploadId: string, pwd: string): Promise<void> {
+  await r
+    .post(
+      "/fs/chunked/abort",
+      { upload_id: uploadId },
+      { headers: { Password: pwd } },
+    )
+    .catch(() => {})
 }
 
 // Standard single-request upload: sends entire file via PUT /fs/put
@@ -130,12 +187,14 @@ const SingleUpload = async (
   asTask: boolean,
   overwrite: boolean,
   headers: { [k: string]: any },
+  signal?: AbortSignal,
 ): Promise<void> => {
   let oldTimestamp = Date.now()
   let oldLoaded = 0
 
   const resp: EmptyResp = await r.put("/fs/put", file, {
     headers: headers,
+    signal,
     onUploadProgress: (progressEvent) => {
       if (progressEvent.total) {
         const complete =
@@ -165,7 +224,7 @@ const SingleUpload = async (
 }
 
 // StreamUpload: auto-detects file size and switches to chunked upload when needed.
-// When chunked upload is enabled in settings and the file exceeds the configured
+// When chunked upload is enabled in settings and the file reaches the configured
 // threshold, the file is split into chunks and uploaded via /fs/chunked/* endpoints.
 // Otherwise falls back to standard single-request PUT /fs/put.
 export const StreamUpload: Upload = async (
@@ -175,6 +234,7 @@ export const StreamUpload: Upload = async (
   asTask = false,
   overwrite = false,
   rapid = false,
+  signal?: AbortSignal,
 ): Promise<undefined> => {
   // Compute hashes if rapid upload is requested (used by both paths)
   let hashValues: { md5: string; sha1: string; sha256: string } | undefined
@@ -200,6 +260,7 @@ export const StreamUpload: Upload = async (
       asTask,
       overwrite,
       hashValues,
+      signal,
     )
   } else {
     // Build headers for standard upload
@@ -216,6 +277,14 @@ export const StreamUpload: Upload = async (
       headers["X-File-Sha1"] = hashValues.sha1
       headers["X-File-Sha256"] = hashValues.sha256
     }
-    await SingleUpload(uploadPath, file, setUpload, asTask, overwrite, headers)
+    await SingleUpload(
+      uploadPath,
+      file,
+      setUpload,
+      asTask,
+      overwrite,
+      headers,
+      signal,
+    )
   }
 }

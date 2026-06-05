@@ -46,10 +46,7 @@ export const FormUpload: Upload = async (
         if (duration > 1) {
           const loaded = progressEvent.loaded - oldLoaded
           const speed = loaded / duration
-          const remain = progressEvent.total - progressEvent.loaded
-          const remainTime = remain / speed
           setUpload("speed", speed)
-          console.log(remainTime)
 
           oldTimestamp = timestamp
           oldLoaded = progressEvent.loaded

@@ -28,8 +28,13 @@ import { File2Upload, traverseFileTree } from "./util"
 import { SelectWrapper } from "~/components"
 import { getUploads } from "./uploads"
 
-const UploadFile = (props: UploadFileProps) => {
+// Terminal statuses for filtering "done" uploads
+const TERMINAL = new Set(["success", "error", "cancelled"])
+const ACTIVE = new Set(["pending", "hashing", "uploading", "backending"])
+
+const UploadFile = (props: UploadFileProps & { onCancel?: () => void }) => {
   const t = useT()
+  const isActive = () => ACTIVE.has(props.status)
   return (
     <VStack
       w="$full"
@@ -42,13 +47,19 @@ const UploadFile = (props: UploadFileProps) => {
         border: `1px solid ${getMainColor()}`,
       }}
     >
-      <Text
-        css={{
-          wordBreak: "break-all",
-        }}
-      >
-        {props.path}
-      </Text>
+      <HStack w="$full" justifyContent="space-between">
+        <Text css={{ wordBreak: "break-all", flex: 1 }}>{props.path}</Text>
+        <Show when={isActive()}>
+          <Button
+            size="xs"
+            colorScheme="danger"
+            variant="ghost"
+            onClick={() => props.onCancel?.()}
+          >
+            {t("home.upload.cancel")}
+          </Button>
+        </Show>
+      </HStack>
       <HStack spacing="$2" w="$full" justifyContent="space-between">
         <HStack spacing="$2">
           <Badge colorScheme={StatusBadge[props.status]}>
@@ -66,7 +77,6 @@ const UploadFile = (props: UploadFileProps) => {
         size="sm"
       >
         <ProgressIndicator color={getMainColor()} rounded="$md" />
-        {/* <ProgressLabel /> */}
       </Progress>
       <Text color="$danger10">{props.msg}</Text>
     </VStack>
@@ -84,10 +94,12 @@ const Upload = () => {
   }>({
     uploads: [],
   })
+
+  // Per-file AbortControllers for cancellation support
+  const abortControllers = new Map<string, AbortController>()
+
   const allDone = () => {
-    return uploadFiles.uploads.every(({ status }) =>
-      ["success", "error"].includes(status),
-    )
+    return uploadFiles.uploads.every(({ status }) => TERMINAL.has(status))
   }
   let fileInput!: HTMLInputElement
   let folderInput!: HTMLInputElement
@@ -109,11 +121,22 @@ const Upload = () => {
     setUploadFiles("uploads", (upload) => upload.path === path, key, value)
   }
 
+  const cancelUpload = (path: string) => {
+    const ctrl = abortControllers.get(path)
+    if (ctrl) {
+      ctrl.abort()
+      abortControllers.delete(path)
+    }
+  }
+
   // All upload methods are available by default
   const uploaders = getUploads()
   const [curUploader, setCurUploader] = createSignal(uploaders[0])
   const handleFile = async (file: File) => {
     const path = file.webkitRelativePath ? file.webkitRelativePath : file.name
+    const controller = new AbortController()
+    abortControllers.set(path, controller)
+
     setUpload(path, "status", "uploading")
     const uploadPath = pathJoin(pathname(), path)
     try {
@@ -127,19 +150,28 @@ const Upload = () => {
           uploadConfig.asTask,
           uploadConfig.overwrite,
           uploadConfig.rapid,
+          controller.signal,
         )
         .catch((err) => err)
       if (!err) {
         setUpload(path, "status", "success")
         setUpload(path, "progress", 100)
+      } else if (err.message === "Upload cancelled") {
+        setUpload(path, "status", "cancelled")
       } else {
         setUpload(path, "status", "error")
         setUpload(path, "msg", err.message)
       }
     } catch (e: any) {
-      console.error(e)
-      setUpload(path, "status", "error")
-      setUpload(path, "msg", e.message)
+      if (e?.message === "Upload cancelled") {
+        setUpload(path, "status", "cancelled")
+      } else {
+        console.error(e)
+        setUpload(path, "status", "error")
+        setUpload(path, "msg", e.message)
+      }
+    } finally {
+      abortControllers.delete(path)
     }
   }
   return (
@@ -152,12 +184,14 @@ const Upload = () => {
               <Button
                 colorScheme="accent"
                 onClick={() => {
+                  // Cancel all active uploads before clearing
+                  for (const [, ctrl] of abortControllers) {
+                    ctrl.abort()
+                  }
+                  abortControllers.clear()
                   setUploadFiles("uploads", (_uploads) =>
-                    _uploads.filter(
-                      ({ status }) => !["success", "error"].includes(status),
-                    ),
+                    _uploads.filter(({ status }) => !TERMINAL.has(status)),
                   )
-                  console.log(uploadFiles.uploads)
                 }}
               >
                 {t("home.upload.clear_done")}
@@ -173,7 +207,12 @@ const Upload = () => {
               </Show>
             </HStack>
             <For each={uploadFiles.uploads}>
-              {(upload) => <UploadFile {...upload} />}
+              {(upload) => (
+                <UploadFile
+                  {...upload}
+                  onCancel={() => cancelUpload(upload.path)}
+                />
+              )}
             </For>
           </>
         }

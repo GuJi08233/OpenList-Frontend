@@ -175,6 +175,8 @@
     "backending": "Uploading in the backend",
     "success": "Success",
     "error": "Error",
+    "cancelled": "Cancelled",
+    "cancel": "Cancel",
     "back": "Back to Upload",
     "clear_done": "Clear Done"
   },
