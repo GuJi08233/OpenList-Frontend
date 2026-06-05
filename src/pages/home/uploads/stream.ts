@@ -86,7 +86,13 @@ const ChunkedUpload = async (
 
     if (chunkResp.code !== 200) {
       // Abort the session on failure to clean up server-side temp files
-      await r.post("/fs/chunked/abort", { upload_id: uploadId }).catch(() => {})
+      await r
+        .post(
+          "/fs/chunked/abort",
+          { upload_id: uploadId },
+          { headers: { Password: pwd } },
+        )
+        .catch(() => {})
       throw new Error(
         chunkResp.message || `Failed to upload chunk ${i + 1}/${totalChunks}`,
       )
@@ -97,12 +103,21 @@ const ChunkedUpload = async (
 
   // Step 3: Complete — merge all chunks and write to storage
   setUpload("status", "backending")
-  const completeResp: any = await r.post("/fs/chunked/complete", {
-    upload_id: uploadId,
-    as_task: asTask,
-  })
+  const completeResp: any = await r.post(
+    "/fs/chunked/complete",
+    { upload_id: uploadId, as_task: asTask },
+    { headers: { Password: pwd } },
+  )
 
   if (completeResp.code !== 200) {
+    // Abort to clean up server-side temp files on complete failure
+    await r
+      .post(
+        "/fs/chunked/abort",
+        { upload_id: uploadId },
+        { headers: { Password: pwd } },
+      )
+      .catch(() => {})
     throw new Error(completeResp.message || "Failed to complete chunked upload")
   }
 }
