@@ -10,6 +10,7 @@ export const FormUpload: Upload = async (
   asTask = false,
   overwrite = false,
   rapid = false,
+  signal?: AbortSignal,
 ): Promise<undefined> => {
   let oldTimestamp = new Date().valueOf()
   let oldLoaded = 0
@@ -17,17 +18,23 @@ export const FormUpload: Upload = async (
   form.append("file", file)
   let headers: { [k: string]: any } = {
     "File-Path": encodeURIComponent(uploadPath),
-    "As-Task": asTask,
-    "Content-Type": "multipart/form-data",
+    "As-Task": asTask.toString(),
     "Last-Modified": file.lastModified,
     Password: password(),
     Overwrite: overwrite.toString(),
   }
   if (rapid) {
     setUpload("status", "hashing")
-    const { md5, sha1, sha256 } = await calculateHash(file, (p) => {
-      setUpload("progress", p | 0)
-    })
+    const { md5, sha1, sha256 } = await calculateHash(
+      file,
+      (p) => {
+        setUpload("progress", p | 0)
+      },
+      signal,
+    )
+    if (signal?.aborted) {
+      throw new Error("Upload cancelled")
+    }
     headers["X-File-Md5"] = md5
     headers["X-File-Sha1"] = sha1
     headers["X-File-Sha256"] = sha256
@@ -35,6 +42,7 @@ export const FormUpload: Upload = async (
   setUpload("status", "uploading")
   const resp: EmptyResp = await r.put("/fs/form", form, {
     headers: headers,
+    signal,
     onUploadProgress: (progressEvent) => {
       if (progressEvent.total) {
         const complete =
@@ -60,6 +68,8 @@ export const FormUpload: Upload = async (
   })
   if (resp.code === 200) {
     return
+  } else if (resp.code === -1) {
+    throw new Error("Upload cancelled")
   } else {
     throw new Error(resp.message)
   }

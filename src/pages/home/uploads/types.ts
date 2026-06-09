@@ -7,6 +7,7 @@ type Status =
   | "error"
   | "cancelled"
 export interface UploadFileProps {
+  id: string
   name: string
   path: string
   size: number

@@ -32,6 +32,11 @@ import { getUploads } from "./uploads"
 const TERMINAL = new Set(["success", "error", "cancelled"])
 const ACTIVE = new Set(["pending", "hashing", "uploading", "backending"])
 
+type UploadJob = {
+  file: File
+  upload: UploadFileProps
+}
+
 const UploadFile = (props: UploadFileProps & { onCancel?: () => void }) => {
   const t = useT()
   const isActive = () => ACTIVE.has(props.status)
@@ -106,38 +111,42 @@ const Upload = () => {
   const handleAddFiles = async (files: File[]) => {
     if (files.length === 0) return
     setUploading(true)
-    for (const file of files) {
-      const upload = File2Upload(file)
-      setUploadFiles("uploads", (uploads) => [...uploads, upload])
-    }
-    for await (const ms of asyncPool(3, files, handleFile)) {
+    const jobs = files.map((file) => ({
+      file,
+      upload: File2Upload(file),
+    }))
+    setUploadFiles("uploads", (uploads) => [
+      ...uploads,
+      ...jobs.map(({ upload }) => upload),
+    ])
+    for await (const ms of asyncPool(3, jobs, handleFile)) {
       console.log(ms)
     }
     refresh()
     // 再次延迟刷新一次，以便能看到后端异步生成的 BT 文件（如 189/189pc 驱动的 .cas.torrent）
     setTimeout(() => refresh(undefined, true), 5000)
   }
-  const setUpload = (path: string, key: keyof UploadFileProps, value: any) => {
-    setUploadFiles("uploads", (upload) => upload.path === path, key, value)
+  const setUpload = (id: string, key: keyof UploadFileProps, value: any) => {
+    setUploadFiles("uploads", (upload) => upload.id === id, key, value)
   }
 
-  const cancelUpload = (path: string) => {
-    const ctrl = abortControllers.get(path)
+  const cancelUpload = (id: string) => {
+    const ctrl = abortControllers.get(id)
     if (ctrl) {
       ctrl.abort()
-      abortControllers.delete(path)
+      abortControllers.delete(id)
     }
   }
 
   // All upload methods are available by default
   const uploaders = getUploads()
   const [curUploader, setCurUploader] = createSignal(uploaders[0])
-  const handleFile = async (file: File) => {
-    const path = file.webkitRelativePath ? file.webkitRelativePath : file.name
+  const handleFile = async ({ file, upload }: UploadJob) => {
+    const { id, path } = upload
     const controller = new AbortController()
-    abortControllers.set(path, controller)
+    abortControllers.set(id, controller)
 
-    setUpload(path, "status", "uploading")
+    setUpload(id, "status", "uploading")
     const uploadPath = pathJoin(pathname(), path)
     try {
       const err = await curUploader()
@@ -145,7 +154,7 @@ const Upload = () => {
           uploadPath,
           file,
           (key, value) => {
-            setUpload(path, key, value)
+            setUpload(id, key, value)
           },
           uploadConfig.asTask,
           uploadConfig.overwrite,
@@ -154,24 +163,24 @@ const Upload = () => {
         )
         .catch((err) => err)
       if (!err) {
-        setUpload(path, "status", "success")
-        setUpload(path, "progress", 100)
+        setUpload(id, "status", "success")
+        setUpload(id, "progress", 100)
       } else if (err.message === "Upload cancelled") {
-        setUpload(path, "status", "cancelled")
+        setUpload(id, "status", "cancelled")
       } else {
-        setUpload(path, "status", "error")
-        setUpload(path, "msg", err.message)
+        setUpload(id, "status", "error")
+        setUpload(id, "msg", err.message)
       }
     } catch (e: any) {
       if (e?.message === "Upload cancelled") {
-        setUpload(path, "status", "cancelled")
+        setUpload(id, "status", "cancelled")
       } else {
         console.error(e)
-        setUpload(path, "status", "error")
-        setUpload(path, "msg", e.message)
+        setUpload(id, "status", "error")
+        setUpload(id, "msg", e.message)
       }
     } finally {
-      abortControllers.delete(path)
+      abortControllers.delete(id)
     }
   }
   return (
@@ -184,11 +193,6 @@ const Upload = () => {
               <Button
                 colorScheme="accent"
                 onClick={() => {
-                  // Cancel all active uploads before clearing
-                  for (const [, ctrl] of abortControllers) {
-                    ctrl.abort()
-                  }
-                  abortControllers.clear()
                   setUploadFiles("uploads", (_uploads) =>
                     _uploads.filter(({ status }) => !TERMINAL.has(status)),
                   )
@@ -210,7 +214,7 @@ const Upload = () => {
               {(upload) => (
                 <UploadFile
                   {...upload}
-                  onCancel={() => cancelUpload(upload.path)}
+                  onCancel={() => cancelUpload(upload.id)}
                 />
               )}
             </For>

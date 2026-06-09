@@ -2,6 +2,10 @@ import { UploadFileProps } from "./types"
 import type { WorkerMessage } from "./hash-worker"
 import HashWorker from "./hash-worker?worker&inline"
 
+const createUploadId = () =>
+  crypto.randomUUID?.() ??
+  `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
 export const traverseFileTree = async (entry: FileSystemEntry) => {
   const res: File[] = []
 
@@ -13,11 +17,15 @@ export const traverseFileTree = async (entry: FileSystemEntry) => {
       }
       if (entry.isFile) {
         ;(entry as FileSystemFileEntry).file((file) => {
-          const newFile = new File([file], path + file.name, {
+          const relativePath = path + file.name
+          const newFile = new File([file], file.name, {
             type: file.type,
+            lastModified: file.lastModified,
+          })
+          Object.defineProperty(newFile, "webkitRelativePath", {
+            value: relativePath,
           })
           res.push(newFile)
-          console.log(newFile)
           resolve()
         }, errorCallback)
       } else if (entry.isDirectory) {
@@ -56,6 +64,7 @@ export const traverseFileTree = async (entry: FileSystemEntry) => {
 
 export const File2Upload = (file: File): UploadFileProps => {
   return {
+    id: createUploadId(),
     name: file.name,
     path: file.webkitRelativePath || file.name,
     size: file.size,
@@ -68,15 +77,30 @@ export const File2Upload = (file: File): UploadFileProps => {
 export const calculateHash = async (
   file: File,
   onProgress?: (progress: number) => void,
+  signal?: AbortSignal,
 ) => {
   return new Promise<{ md5: string; sha1: string; sha256: string }>(
     (resolve, reject) => {
       const worker = new HashWorker()
+      let settled = false
+      let abort: () => void
 
       const terminate = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener("abort", abort)
         worker.terminate()
         fn()
       }
+
+      abort = () => {
+        terminate(() => reject(new Error("Upload cancelled")))
+      }
+      if (signal?.aborted) {
+        abort()
+        return
+      }
+      signal?.addEventListener("abort", abort, { once: true })
 
       worker.postMessage({ file })
 

@@ -1,6 +1,8 @@
 import { Upload, SetUpload } from "./types"
 import { r, pathDir } from "~/utils"
 
+const UPLOAD_CANCELLED_MESSAGE = "Upload cancelled"
+
 // Create a speed calculator using closure
 function createSpeedCalculator(throttleMs = 500) {
   let lastLoaded = 0
@@ -26,11 +28,12 @@ export const HttpDirectUpload: Upload = async (
   _asTask: boolean,
   overwrite: boolean,
   _rapid: boolean,
+  signal?: AbortSignal,
 ) => {
   const path = pathDir(uploadPath)
 
   // Get direct upload info from backend
-  const resp = await r.post(
+  const resp: any = await r.post(
     "/fs/get_direct_upload_info",
     {
       path,
@@ -42,8 +45,12 @@ export const HttpDirectUpload: Upload = async (
       headers: {
         Overwrite: overwrite,
       },
+      signal,
     },
   )
+  if (resp.code === -1) {
+    throw new Error(UPLOAD_CANCELLED_MESSAGE)
+  }
 
   const uploadInfo = resp.data
 
@@ -67,6 +74,7 @@ export const HttpDirectUpload: Upload = async (
       method,
       uploadInfo.headers,
       setUpload,
+      signal,
     )
   } else {
     // Single upload for drivers that don't support chunking
@@ -76,6 +84,7 @@ export const HttpDirectUpload: Upload = async (
       method,
       uploadInfo.headers,
       setUpload,
+      signal,
     )
   }
 }
@@ -86,11 +95,24 @@ async function uploadSingle(
   method: string,
   headers?: Record<string, string>,
   setUpload?: SetUpload,
+  signal?: AbortSignal,
 ): Promise<undefined> {
   const xhr = new XMLHttpRequest()
   const calcSpeed = createSpeedCalculator()
 
   return new Promise((resolve, reject) => {
+    const abort = () => {
+      xhr.abort()
+      reject(new Error(UPLOAD_CANCELLED_MESSAGE))
+    }
+    if (signal?.aborted) {
+      abort()
+      return
+    }
+    signal?.addEventListener("abort", abort, { once: true })
+
+    const cleanup = () => signal?.removeEventListener("abort", abort)
+
     xhr.upload.addEventListener("progress", (e) => {
       if (e.lengthComputable && setUpload) {
         const progress = (e.loaded / e.total) * 100
@@ -100,6 +122,7 @@ async function uploadSingle(
     })
 
     xhr.addEventListener("load", () => {
+      cleanup()
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve(undefined)
       } else {
@@ -108,7 +131,12 @@ async function uploadSingle(
     })
 
     xhr.addEventListener("error", () => {
+      cleanup()
       reject(new Error("Upload failed"))
+    })
+    xhr.addEventListener("abort", () => {
+      cleanup()
+      reject(new Error(UPLOAD_CANCELLED_MESSAGE))
     })
 
     xhr.open(method, uploadURL)
@@ -131,6 +159,7 @@ async function uploadChunked(
   method: string,
   headers?: Record<string, string>,
   setUpload?: SetUpload,
+  signal?: AbortSignal,
 ): Promise<undefined> {
   const totalChunks = Math.ceil(file.size / chunkSize)
   const calcSpeed = createSpeedCalculator()
@@ -144,6 +173,18 @@ async function uploadChunked(
     const xhr = new XMLHttpRequest()
 
     await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        xhr.abort()
+        reject(new Error(UPLOAD_CANCELLED_MESSAGE))
+      }
+      if (signal?.aborted) {
+        abort()
+        return
+      }
+      signal?.addEventListener("abort", abort, { once: true })
+
+      const cleanup = () => signal?.removeEventListener("abort", abort)
+
       xhr.upload.addEventListener("progress", (e) => {
         if (e.lengthComputable && setUpload) {
           const totalLoaded = uploadedBytes + e.loaded
@@ -154,6 +195,7 @@ async function uploadChunked(
       })
 
       xhr.addEventListener("load", () => {
+        cleanup()
         if (xhr.status >= 200 && xhr.status < 300) {
           uploadedBytes += chunk.size
           resolve()
@@ -165,7 +207,12 @@ async function uploadChunked(
       })
 
       xhr.addEventListener("error", () => {
+        cleanup()
         reject(new Error(`Upload chunk ${i + 1} failed`))
+      })
+      xhr.addEventListener("abort", () => {
+        cleanup()
+        reject(new Error(UPLOAD_CANCELLED_MESSAGE))
       })
 
       xhr.open(method, uploadURL)
